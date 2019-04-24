@@ -214,7 +214,7 @@ class EndPointTests(TestCase):
     @classmethod
     def tcppair(self) -> Tuple[socket, socket]:
         acceptor = socket(self.AF, SOCK_STREAM)
-        acceptor.bind(('', 0))
+        acceptor.bind(('localhost', 0))
         acceptor.listen(1)
         client = socket(self.AF, SOCK_STREAM)
         client.connect(acceptor.getsockname())
@@ -339,7 +339,7 @@ class BasicFlowTests(TestCase):
     @classmethod
     def listener(self) -> socket:
         s = socket(self.AF, SOCK_STREAM, 0)
-        s.bind(('', 0))
+        s.bind(('localhost', 0))
         s.listen(1)
         s.settimeout(0)
         return s
