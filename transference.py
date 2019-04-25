@@ -19,6 +19,23 @@ class Dispatchable(object):
     def kill(self) -> None:
         pass
 
+    @classmethod
+    def dispatch(self, sel: BaseSelector, timeout: float) -> bool:
+        # Windows bug workaround - select() on an empty set does not work.
+        if not sel.get_map():
+            import time
+            time.sleep(timeout)
+            return False
+        L = sel.select(timeout)
+        for (obj, fd, events, data), ev in L:
+            if ev & EVENT_READ:
+                data.inready()
+            if ev & EVENT_WRITE:
+                data.outready()
+        for (obj, fd, events, data), ev in L:
+            data.reregister(sel)
+        return bool(L)
+
 class SocketReader(Dispatchable):
     __slots__ = 'wanted', 'isreg'
     def __init__(self, s: socket):
@@ -141,31 +158,6 @@ class EndPoint(Dispatchable, Sink):
             S.connected = True
             S.buffer = None
 
-class Poller:
-    __slots__ = 'selector',
-    selector: BaseSelector
-    def __init__(self) -> None:
-        self.selector = DefaultSelector()
-
-    def add(self, e: Dispatchable) -> None:
-        e.reregister(self.selector)
-
-    def dispatch(self, timeout) -> bool:
-        # Windows bug workaround - select() on an empty set does not work.
-        if not self.selector.get_map():
-            import time
-            time.sleep(timeout)
-            return False
-        L = self.selector.select(timeout)
-        for (obj, fd, events, data), ev in L:
-            if ev & EVENT_READ:
-                data.inready()
-            if ev & EVENT_WRITE:
-                data.outready()
-        for (obj, fd, events, data), ev in L:
-            data.reregister(self.selector)
-        return bool(L)
-
 class FlowAcceptor(SocketReader):
     __slots__ = 'destfamily', 'destaddress', 'selector', 'last'
     family: int
@@ -203,7 +195,7 @@ class TestEndPoint(object):
     d: socket
     B: EndPoint
     C: EndPoint
-    E: Poller
+    E: BaseSelector
 
     AF: int = AF_INET
 
@@ -229,10 +221,10 @@ class TestEndPoint(object):
         self.C = EndPoint(self.c, False)
         self.B.peer = self.C
         self.C.peer = self.B
-        self.E = Poller()
-        self.E.add(self.B)
-        self.E.add(self.C)
-        self.E.add(SocketReader(self.d))
+        self.E = DefaultSelector()
+        self.B.reregister(self.E)
+        self.C.reregister(self.E)
+        SocketReader(self.d).reregister(self.E)
 
     def teardown_method(self) -> None:
         for X in self.a, self.b, self.c, self.d:
@@ -267,7 +259,7 @@ class TestEndPoint(object):
         data = memoryview(bytes(range(prime)) * (BUFFER_SIZE // prime + 2))
         one_k = data[0:BUFFER_SIZE]
         while True:
-            self.E.dispatch(0)
+            Dispatchable.dispatch(self.E, 0)
             try:
                 sent += self.a.send(one_k[sent % prime:]) # type: ignore
             except BlockingIOError:
@@ -277,7 +269,7 @@ class TestEndPoint(object):
         # Now drive the I/O and read back, checking the data.
         recv = 0
         while True:
-            assert self.E.dispatch(1)
+            assert Dispatchable.dispatch(self.E, 1)
             try:
                 got = self.d.recv(BUFFER_SIZE)
             except BlockingIOError:
@@ -297,7 +289,7 @@ class TestEndPoint(object):
         self.a.close()
         # Now drive until d doesn't give EAGAIN.
         while True:
-            assert self.E.dispatch(1)
+            assert Dispatchable.dispatch(self.E, 1)
             try:
                 got = self.d.recv(10)
                 assert False
@@ -307,13 +299,12 @@ class TestEndPoint(object):
                 pass
         assert self.B.regevents == 0
         assert self.C.regevents == 0
-        self.E.dispatch(0)
 
     def test_reset_after_shutdown(self) -> None:
         # Do a shutdown on 'a' and then drive until it comes out 'd'.
         self.a.shutdown(SHUT_WR)
         while True:
-            assert self.E.dispatch(1)
+            assert Dispatchable.dispatch(self.E, 1)
             try:
                 got = self.d.recv(10)
                 break
@@ -321,7 +312,7 @@ class TestEndPoint(object):
                 continue
         assert not got
         assert self.C.sinkready
-        self.E.selector.unregister(self.d)
+        self.E.unregister(self.d)
         # Now reset 'a' and check that this comes out 'd'.  It won't
         # spontaneously arrive because we're no longer reading, but eventually
         # a write should get an error.
@@ -331,7 +322,7 @@ class TestEndPoint(object):
         with pytest.raises(ConnectionError):
             for _ in range(10):
                 self.d.send(b'1')
-                self.E.dispatch(0.1)
+                Dispatchable.dispatch(self.E, 0.1)
 
 class TestEndPoint6(TestEndPoint):
     AF = AF_INET6
@@ -364,14 +355,14 @@ class TestBasicFlow(object):
         return s
 
     def setup_method(self) -> None:
-        self.P = Poller()
+        self.P = DefaultSelector()
         self.DL = SocketReader(self.listener())
         self.BA = FlowAcceptor(self.listener(),
                                self.DL.s.family, self.DL.s.getsockname(),
-                               self.P.selector)
+                               self.P)
         self.BA.s.settimeout(0)
-        self.P.add(self.BA)
-        self.P.add(self.DL)
+        self.BA.reregister(self.P)
+        self.DL.reregister(self.P)
         self.A = MemoReader(socket(self.AF, SOCK_STREAM, 0))
         self.A.s.settimeout(0)
         try:
@@ -383,11 +374,11 @@ class TestBasicFlow(object):
         self.A.s.close()
         self.BA.s.close()
         self.DL.s.close()
-        self.P.selector.close()
+        self.P.close()
 
     def test_connect(self) -> None:
         while True:
-            assert self.P.dispatch(1)
+            assert Dispatchable.dispatch(self.P, 1)
             try:
                 fd, _ = self.DL.s._accept() # type: ignore
                 break
@@ -398,10 +389,10 @@ class TestBasicFlow(object):
         self.A.s.shutdown(SHUT_WR)
         D.s.send(b'otherdirection')
         D.s.shutdown(SHUT_WR)
-        self.A.reregister(self.P.selector)
-        D.reregister(self.P.selector)
+        self.A.reregister(self.P)
+        D.reregister(self.P)
         while D.isreg or self.A.isreg:
-            assert self.P.dispatch(1)
+            assert Dispatchable.dispatch(self.P, 1)
         assert not D.wanted
         assert not self.A.wanted
         assert self.A.memo == b'otherdirection'
