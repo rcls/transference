@@ -3,19 +3,17 @@
 from socket import *
 from selectors import BaseSelector, DefaultSelector, EVENT_READ, EVENT_WRITE
 import struct
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Type, TypeVar
 
 BUFFER_SIZE = 1024
 
-class Dispatchable(object):
-    s: socket
-    __slots__ = 's'
+class Dispatchable(socket):
     def inready(self) -> None:
         pass
     def outready(self) -> None:
         pass
     def reregister(self, sel: BaseSelector) -> None:
-        pass
+        raise NotImplementedError
     def kill(self) -> None:
         pass
 
@@ -38,18 +36,18 @@ class Dispatchable(object):
 
 class SocketReader(Dispatchable):
     __slots__ = 'wanted', 'isreg'
-    def __init__(self, s: socket):
-        self.s = s
+    def __init__(self, *args, **kwargs):
+        super(SocketReader, self).__init__(*args, **kwargs)
         self.wanted = True
         self.isreg = False
     def reregister(self, sel: BaseSelector) -> None:
         if self.wanted and not self.isreg:
-            sel.register(self.s, EVENT_READ, self)
+            sel.register(self, EVENT_READ, self)
         elif self.isreg and not self.wanted:
-            sel.unregister(self.s)
+            sel.unregister(self)
         self.isreg = self.wanted
     def kill(self) -> None:
-        self.s.close()
+        self.close()
         self.wanted = False
 
 class Sink(object):
@@ -67,10 +65,10 @@ class EndPoint(Dispatchable, Sink):
     regevents: int
 
     __slots__ = 'sinkready', 'connected', 'peer', 'buffer', 'regevents'
-    def __init__(self, s: socket, connected: bool):
-        self.s         = s
+    def __init__(self, *args, **kwargs):
+        super(EndPoint, self).__init__(*args, **kwargs)
         self.sinkready = True
-        self.connected = connected
+        self.connected = True
         self.buffer    = None # Output buffer
         self.regevents = 0
 
@@ -79,7 +77,7 @@ class EndPoint(Dispatchable, Sink):
             return
 
         try:
-            data = self.s.recv(BUFFER_SIZE)
+            data = self.recv(BUFFER_SIZE)
         except BlockingIOError as e:
             return
         except OSError as e:
@@ -94,7 +92,7 @@ class EndPoint(Dispatchable, Sink):
     def do_out(self, data: memoryview) -> bool:
         self.buffer = None
         try:
-            n = self.s.send(data)       # type: ignore
+            n = self.send(data)         # type: ignore
         except BlockingIOError:
             self.buffer = data
             return False
@@ -113,7 +111,7 @@ class EndPoint(Dispatchable, Sink):
         assert(self.buffer is None)
         if not data:
             try:
-                self.s.shutdown(SHUT_WR)
+                self.shutdown(SHUT_WR)
                 self.connected = True
             except OSError as e:
                 pass
@@ -136,24 +134,24 @@ class EndPoint(Dispatchable, Sink):
             if wanted == S.regevents:
                 continue
             elif S.regevents == 0:
-                sel.register(S.s, wanted, S)
+                sel.register(S, wanted, S)
             elif wanted == 0:
-                sel.unregister(S.s)
+                sel.unregister(S)
             else:
-                sel.modify(S.s, wanted, S)
+                sel.modify(S, wanted, S)
             S.regevents = wanted
         if self.regevents == 0 and self.peer.regevents == 0:
             self.kill()
 
     def so_linger_0(self) -> None:
         try:
-            self.s.setsockopt(SOL_SOCKET, SO_LINGER, struct.pack('ii', 1, 0))
+            self.setsockopt(SOL_SOCKET, SO_LINGER, struct.pack('ii', 1, 0))
         except OSError:
             pass
 
     def kill(self) -> None:
         for S in self, self.peer:
-            S.s.close()
+            S.close()
             S.sinkready = False
             S.connected = True
             S.buffer = None
@@ -162,86 +160,88 @@ class FlowAcceptor(SocketReader):
     __slots__ = 'destfamily', 'destaddress', 'selector', 'last'
     family: int
     selector: BaseSelector
-    def __init__(self, s: socket, destfamily, destaddress, sel: BaseSelector):
-        super(FlowAcceptor, self).__init__(s)
+    def __init__(self, destfamily: int, destaddress, sel: BaseSelector,
+                 *args, **kwargs):
+        super(FlowAcceptor, self).__init__(*args, **kwargs)
         self.destfamily  = destfamily
         self.destaddress = destaddress
         self.selector    = sel
     def inready(self) -> None:
         try:
-            fd, _ = self.s._accept() # type: ignore
+            fd, _ = self._accept()      # type: ignore
         except OSError:
             return
-        ss = socket(fileno=fd)
-        ss.settimeout(0)
-        A = EndPoint(ss, True)
-        cc = socket(self.destfamily, SOCK_STREAM, 0)
-        cc.settimeout(0)
+        A = EndPoint(fileno=fd)
+        B = EndPoint(self.destfamily, SOCK_STREAM, 0)
+        A.settimeout(0)
+        B.settimeout(0)
         try:
-            cc.connect(self.destaddress)
+            B.connect(self.destaddress)
         except BlockingIOError:
             pass
-        B = EndPoint(cc, False)
+        B.connected = False
         A.peer = B
         B.peer = A
         A.reregister(self.selector)
         B.reregister(self.selector)
         self.last = A, B
 
+X = TypeVar('X', bound=socket)
+Y = TypeVar('Y', bound=socket)
+
 class TestEndPoint(object):
-    a: socket
-    b: socket
-    c: socket
-    d: socket
-    B: EndPoint
-    C: EndPoint
+    a: SocketReader
+    b: EndPoint
+    c: EndPoint
+    d: SocketReader
     E: BaseSelector
 
     AF: int = AF_INET
 
     @classmethod
-    def tcppair(self) -> Tuple[socket, socket]:
+    def tcppair(self, C: Type[X], S: Type[Y]) -> Tuple[X, Y]:
         acceptor = socket(self.AF, SOCK_STREAM)
         acceptor.bind(('localhost', 0))
         acceptor.listen(1)
-        client = socket(self.AF, SOCK_STREAM)
+        client = C(self.AF, SOCK_STREAM)
         client.connect(acceptor.getsockname())
         serverfd, _ = acceptor._accept() # type: ignore
-        server = socket(fileno=serverfd)
+        server = S(fileno=serverfd)
         acceptor.close()
-        for s in client, server:
-            s.settimeout(0)
-            s.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
+        client.settimeout(0)
+        client.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
+        server.settimeout(0)
+        server.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
         return client, server
 
     def setup_method(self) -> None:
-        self.b, self.a = self.tcppair()
-        self.d, self.c = self.tcppair()
-        self.B = EndPoint(self.b, True)
-        self.C = EndPoint(self.c, False)
-        self.B.peer = self.C
-        self.C.peer = self.B
+        self.a, self.b = self.tcppair(SocketReader, EndPoint)
+        self.c, self.d = self.tcppair(EndPoint, SocketReader)
+        self.b.connected = True
+        self.c.connected = False
+        self.b.peer = self.c
+        self.c.peer = self.b
         self.E = DefaultSelector()
-        self.B.reregister(self.E)
-        self.C.reregister(self.E)
-        SocketReader(self.d).reregister(self.E)
+        self.b.reregister(self.E)
+        self.c.reregister(self.E)
+        self.d.reregister(self.E)
 
     def teardown_method(self) -> None:
         for X in self.a, self.b, self.c, self.d:
             X.close()
 
     def test_simple(self) -> None:
-        a, B, C, d = self.a, self.B, self.C, self.d
-        C.connected = False
+        a, b, c, d = self.a, self.b, self.c, self.d
+        c.connected = False
         a.sendall(b'abcd')
-        assert B.sinkready
-        B.inready()
-        assert not B.sinkready
-        C.outready()
-        assert B.sinkready
+        assert b.sinkready
+        b.inready()
+        assert not b.sinkready
+        c.outready()
+        assert b.sinkready
         assert d.recv(10) == b'abcd'
-        B.inready()
-        assert B.sinkready
+        b.inready()
+        assert b.sinkready
         import pytest
         with pytest.raises(BlockingIOError):
             d.recv(10)
@@ -282,7 +282,7 @@ class TestEndPoint(object):
             assert got == expect
             recv += len(got)
         assert sent == recv
-        assert ~self.B.regevents & EVENT_READ
+        assert ~self.b.regevents & EVENT_READ
 
     def test_reset_propagation(self) -> None:
         self.a.setsockopt(SOL_SOCKET, SO_LINGER, struct.pack('ii', 1, 0))
@@ -297,8 +297,8 @@ class TestEndPoint(object):
                 break
             except BlockingIOError:
                 pass
-        assert self.B.regevents == 0
-        assert self.C.regevents == 0
+        assert self.b.regevents == 0
+        assert self.c.regevents == 0
 
     def test_reset_after_shutdown(self) -> None:
         # Do a shutdown on 'a' and then drive until it comes out 'd'.
@@ -311,7 +311,7 @@ class TestEndPoint(object):
             except BlockingIOError:
                 continue
         assert not got
-        assert self.C.sinkready
+        assert self.c.sinkready
         self.E.unregister(self.d)
         # Now reset 'a' and check that this comes out 'd'.  It won't
         # spontaneously arrive because we're no longer reading, but eventually
@@ -330,12 +330,12 @@ class TestEndPoint6(TestEndPoint):
 class MemoReader(SocketReader):
     __slots__ = 'memo'
     memo : bytearray
-    def __init__(self, s: socket):
-        super(MemoReader, self).__init__(s)
+    def __init__(self, *args, **kwargs):
+        super(MemoReader, self).__init__(*args, **kwargs)
         self.memo = bytearray()
     def inready(self) -> None:
         try:
-            b = self.s.recv(BUFFER_SIZE)
+            b = self.recv(BUFFER_SIZE)
         except BlockingIOError:
             return
         if b:
@@ -345,50 +345,53 @@ class MemoReader(SocketReader):
 
 class TestBasicFlow(object):
     AF = AF_INET
+    P: BaseSelector
+    A: MemoReader
+    BA: FlowAcceptor
+    DL: SocketReader
 
     @classmethod
-    def listener(self) -> socket:
-        s = socket(self.AF, SOCK_STREAM, 0)
+    def listen(self, s: socket) -> None:
         s.bind(('localhost', 0))
         s.listen(1)
         s.settimeout(0)
-        return s
+        return
 
     def setup_method(self) -> None:
         self.P = DefaultSelector()
-        self.DL = SocketReader(self.listener())
-        self.BA = FlowAcceptor(self.listener(),
-                               self.DL.s.family, self.DL.s.getsockname(),
-                               self.P)
-        self.BA.s.settimeout(0)
+        self.DL = SocketReader(self.AF)
+        self.listen(self.DL)
+        self.BA = FlowAcceptor(self.DL.family, self.DL.getsockname(),
+                               self.P, self.AF)
+        self.listen(self.BA)
         self.BA.reregister(self.P)
         self.DL.reregister(self.P)
-        self.A = MemoReader(socket(self.AF, SOCK_STREAM, 0))
-        self.A.s.settimeout(0)
+        self.A = MemoReader(self.AF)
         try:
-            self.A.s.connect(self.BA.s.getsockname())
+            self.A.connect(self.BA.getsockname())
         except BlockingIOError:
             pass
+        self.A.settimeout(0)
 
     def teardown_method(self) -> None:
-        self.A.s.close()
-        self.BA.s.close()
-        self.DL.s.close()
+        self.A.close()
+        self.BA.close()
+        self.DL.close()
         self.P.close()
 
     def test_connect(self) -> None:
         while True:
             assert Dispatchable.dispatch(self.P, 1)
             try:
-                fd, _ = self.DL.s._accept() # type: ignore
+                fd, _ = self.DL._accept() # type: ignore
                 break
             except BlockingIOError:
                 continue
-        D = MemoReader(socket(fileno=fd))
-        self.A.s.send(b'testing123')
-        self.A.s.shutdown(SHUT_WR)
-        D.s.send(b'otherdirection')
-        D.s.shutdown(SHUT_WR)
+        D = MemoReader(fileno=fd)
+        self.A.send(b'testing123')
+        self.A.shutdown(SHUT_WR)
+        D.send(b'otherdirection')
+        D.shutdown(SHUT_WR)
         self.A.reregister(self.P)
         D.reregister(self.P)
         while D.isreg or self.A.isreg:
