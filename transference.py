@@ -1,6 +1,5 @@
 #!/usr/bin/python3
 
-import pytest
 from socket import *
 from selectors import BaseSelector, DefaultSelector, EVENT_READ, EVENT_WRITE
 import struct
@@ -152,6 +151,11 @@ class Poller:
         e.reregister(self.selector)
 
     def dispatch(self, timeout) -> bool:
+        # Windows bug workaround - select() on an empty set does not work.
+        if not self.selector.get_map():
+            import time
+            time.sleep(timeout)
+            return False
         L = self.selector.select(timeout)
         for (obj, fd, events, data), ev in L:
             if ev & EVENT_READ:
@@ -246,6 +250,7 @@ class TestEndPoint(object):
         assert d.recv(10) == b'abcd'
         B.inready()
         assert B.sinkready
+        import pytest
         with pytest.raises(BlockingIOError):
             d.recv(10)
 
@@ -315,17 +320,18 @@ class TestEndPoint(object):
             except BlockingIOError:
                 continue
         assert not got
+        assert self.C.sinkready
         self.E.selector.unregister(self.d)
         # Now reset 'a' and check that this comes out 'd'.  It won't
         # spontaneously arrive because we're no longer reading, but eventually
         # a write should get an error.
         self.a.setsockopt(SOL_SOCKET, SO_LINGER, struct.pack('ii', 1, 0))
         self.a.close()
-        self.d.send(b'1')
-        while self.C.sinkready:
-            assert self.E.dispatch(1)
-        with pytest.raises(BrokenPipeError):
-            self.d.send(b'1')
+        import pytest
+        with pytest.raises(ConnectionError):
+            for _ in range(10):
+                self.d.send(b'1')
+                self.E.dispatch(0.1)
 
 class TestEndPoint6(TestEndPoint):
     AF = AF_INET6
