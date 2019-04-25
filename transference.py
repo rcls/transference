@@ -1,10 +1,10 @@
 #!/usr/bin/python3
 
+import pytest
 from socket import *
 from selectors import BaseSelector, DefaultSelector, EVENT_READ, EVENT_WRITE
 import struct
 from typing import Optional, Tuple
-from unittest import TestCase
 
 BUFFER_SIZE = 1024
 
@@ -64,7 +64,6 @@ class EndPoint(Dispatchable, Sink):
 
         try:
             data = self.s.recv(BUFFER_SIZE)
-            fullread = len(data) == BUFFER_SIZE
         except BlockingIOError as e:
             return
         except OSError as e:
@@ -84,7 +83,8 @@ class EndPoint(Dispatchable, Sink):
             self.buffer = data
             return False
         except OSError as e:
-            # We should get a read error on the input which will propagate...
+            self.peer.so_linger_0()
+            self.kill()
             return False                # No more data please.
 
         if n == len(data):
@@ -192,7 +192,7 @@ class FlowAcceptor(SocketReader):
         B.reregister(self.selector)
         self.last = A, B
 
-class EndPointTests(TestCase):
+class TestEndPoint(object):
     a: socket
     b: socket
     c: socket
@@ -204,14 +204,6 @@ class EndPointTests(TestCase):
     AF: int = AF_INET
 
     @classmethod
-    def lowlatency(self, s: socket):
-        s.settimeout(0)
-        s.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
-        #s.setsockopt(IPPROTO_TCP, TCP_MAXSEG, 88)
-        #print(s.getsockopt(IPPROTO_TCP, TCP_MAXSEG))
-        #s.setsockopt(IPPROTO_TCP, TCP_QUICKACK, 1)
-
-    @classmethod
     def tcppair(self) -> Tuple[socket, socket]:
         acceptor = socket(self.AF, SOCK_STREAM)
         acceptor.bind(('localhost', 0))
@@ -221,21 +213,24 @@ class EndPointTests(TestCase):
         serverfd, _ = acceptor._accept() # type: ignore
         server = socket(fileno=serverfd)
         acceptor.close()
-        self.lowlatency(client)
-        self.lowlatency(server)
+        for s in client, server:
+            s.settimeout(0)
+            s.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
         return client, server
 
-    def setUp(self) -> None:
+    def setup_method(self) -> None:
         self.b, self.a = self.tcppair()
         self.d, self.c = self.tcppair()
-        self.e = DefaultSelector()
         self.B = EndPoint(self.b, True)
         self.C = EndPoint(self.c, False)
         self.B.peer = self.C
         self.C.peer = self.B
         self.E = Poller()
+        self.E.add(self.B)
+        self.E.add(self.C)
+        self.E.add(SocketReader(self.d))
 
-    def tearDown(self) -> None:
+    def teardown_method(self) -> None:
         for X in self.a, self.b, self.c, self.d:
             X.close()
 
@@ -243,15 +238,16 @@ class EndPointTests(TestCase):
         a, B, C, d = self.a, self.B, self.C, self.d
         C.connected = False
         a.sendall(b'abcd')
-        self.assertTrue(B.sinkready)
+        assert B.sinkready
         B.inready()
-        self.assertFalse(B.sinkready)
+        assert not B.sinkready
         C.outready()
-        self.assertTrue(B.sinkready)
-        self.assertEqual(d.recv(10), b'abcd')
+        assert B.sinkready
+        assert d.recv(10) == b'abcd'
         B.inready()
-        self.assertTrue(B.sinkready)
-        self.assertRaises(BlockingIOError, d.recv, 10)
+        assert B.sinkready
+        with pytest.raises(BlockingIOError):
+            d.recv(10)
 
     def test_overload(self) -> None:
         # Pump data into the socket until it jams completely.
@@ -263,23 +259,20 @@ class EndPointTests(TestCase):
 
         sent = 0
         prime = 251
-        data = memoryview(bytes(range(prime)) * (3 * BUFFER_SIZE // prime))
+        data = memoryview(bytes(range(prime)) * (BUFFER_SIZE // prime + 2))
         one_k = data[0:BUFFER_SIZE]
-        self.E.add(self.B)
-        self.E.add(self.C)
         while True:
             self.E.dispatch(0)
             try:
                 sent += self.a.send(one_k[sent % prime:]) # type: ignore
             except BlockingIOError:
                 break
-        self.assertTrue(sent > len(one_k))
+        assert sent > len(one_k)
         self.a.shutdown(SHUT_WR)
         # Now drive the I/O and read back, checking the data.
         recv = 0
-        self.E.add(SocketReader(self.d))
         while True:
-            self.assertTrue(self.E.dispatch(1))
+            assert self.E.dispatch(1)
             try:
                 got = self.d.recv(BUFFER_SIZE)
             except BlockingIOError:
@@ -288,33 +281,53 @@ class EndPointTests(TestCase):
             if not got:
                 break
 
-            expect = data[recv % prime: recv % prime + len(got)]
-            self.assertEqual(got, expect)
+            expect = data[recv % prime : recv % prime + len(got)]
+            assert got == expect
             recv += len(got)
-        self.assertEqual(sent, recv)
-        self.assertFalse(self.B.regevents & EVENT_READ)
+        assert sent == recv
+        assert ~self.B.regevents & EVENT_READ
 
     def test_reset_propagation(self) -> None:
-        self.E.add(self.B)
-        self.E.add(self.C)
-        self.E.add(SocketReader(self.d))
         self.a.setsockopt(SOL_SOCKET, SO_LINGER, struct.pack('ii', 1, 0))
         self.a.close()
         # Now drive until d doesn't give EAGAIN.
         while True:
-            self.assertTrue(self.E.dispatch(1))
+            assert self.E.dispatch(1)
             try:
                 got = self.d.recv(10)
-                self.fail("Shouldn't get here " + str(got))
+                assert False
             except ConnectionResetError:
                 break
             except BlockingIOError:
                 pass
-        self.assertEqual(self.B.regevents, 0)
-        self.assertEqual(self.C.regevents, 0)
+        assert self.B.regevents == 0
+        assert self.C.regevents == 0
         self.E.dispatch(0)
 
-class EndPointTests6(EndPointTests):
+    def test_reset_after_shutdown(self) -> None:
+        # Do a shutdown on 'a' and then drive until it comes out 'd'.
+        self.a.shutdown(SHUT_WR)
+        while True:
+            assert self.E.dispatch(1)
+            try:
+                got = self.d.recv(10)
+                break
+            except BlockingIOError:
+                continue
+        assert not got
+        self.E.selector.unregister(self.d)
+        # Now reset 'a' and check that this comes out 'd'.  It won't
+        # spontaneously arrive because we're no longer reading, but eventually
+        # a write should get an error.
+        self.a.setsockopt(SOL_SOCKET, SO_LINGER, struct.pack('ii', 1, 0))
+        self.a.close()
+        self.d.send(b'1')
+        while self.C.sinkready:
+            assert self.E.dispatch(1)
+        with pytest.raises(BrokenPipeError):
+            self.d.send(b'1')
+
+class TestEndPoint6(TestEndPoint):
     AF = AF_INET6
 
 class MemoReader(SocketReader):
@@ -333,7 +346,7 @@ class MemoReader(SocketReader):
         else:
             self.wanted = False
 
-class BasicFlowTests(TestCase):
+class TestBasicFlow(object):
     AF = AF_INET
 
     @classmethod
@@ -344,7 +357,7 @@ class BasicFlowTests(TestCase):
         s.settimeout(0)
         return s
 
-    def setUp(self) -> None:
+    def setup_method(self) -> None:
         self.P = Poller()
         self.DL = SocketReader(self.listener())
         self.BA = FlowAcceptor(self.listener(),
@@ -360,7 +373,7 @@ class BasicFlowTests(TestCase):
         except BlockingIOError:
             pass
 
-    def tearDown(self) -> None:
+    def teardown_method(self) -> None:
         self.A.s.close()
         self.BA.s.close()
         self.DL.s.close()
@@ -368,7 +381,7 @@ class BasicFlowTests(TestCase):
 
     def test_connect(self) -> None:
         while True:
-            self.assertTrue(self.P.dispatch(1))
+            assert self.P.dispatch(1)
             try:
                 fd, _ = self.DL.s._accept() # type: ignore
                 break
@@ -382,12 +395,12 @@ class BasicFlowTests(TestCase):
         self.A.reregister(self.P.selector)
         D.reregister(self.P.selector)
         while D.isreg or self.A.isreg:
-            self.assertTrue(self.P.dispatch(1))
-        self.assertFalse(D.wanted)
-        self.assertFalse(self.A.wanted)
-        self.assertEqual(self.A.memo, b'otherdirection')
-        self.assertEqual(D.memo, b'testing123')
+            assert self.P.dispatch(1)
+        assert not D.wanted
+        assert not self.A.wanted
+        assert self.A.memo == b'otherdirection'
+        assert D.memo == b'testing123'
         D.kill()
 
-class BasicFlowTests6(BasicFlowTests):
+class TestBasicFlow6(TestBasicFlow):
     AF = AF_INET6
