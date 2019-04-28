@@ -3,12 +3,15 @@
 import argparse
 import typing
 if typing.TYPE_CHECKING:
+    import socket as socketmodule
     from socket import *
 else:
+    import _socket as socketmodule
     from _socket import *
 from selectors import BaseSelector, DefaultSelector, EVENT_READ, EVENT_WRITE
 import struct
-from typing import Any, List, Optional, Tuple, Type, TypeVar, Union
+from typing import \
+    Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union
 import yaml
 
 BUFFER_SIZE = 1024
@@ -65,16 +68,20 @@ class SocketReader(Dispatchable):
         self.wanted = False
 
 class Sink(object):
-    def do_out(self, data: memoryview) -> bool:
+    def out(self, data: memoryview) -> bool:
         pass
 
 class Filter(Sink):
+    chain: Sink
     __slots__ = 'chain'
+
+FilterCreator = Callable[['EndPoint', Any],Optional[Filter]]
 
 class EndPoint(Dispatchable, Sink):
     sinkready: bool
     connected: bool
     peer     : 'EndPoint'
+    sink     : Sink
     buffer   : Optional[memoryview]
     regevents: int
 
@@ -100,7 +107,15 @@ class EndPoint(Dispatchable, Sink):
             self.kill()
             return
 
-        self.sinkready = self.peer.out(memoryview(data))
+        self.sinkready = self.sink.out(memoryview(data))
+
+    def setfilters(self, creators : List[Tuple[int,FilterCreator,Any]]):
+        self.sink = self.peer
+        for _, C, A in reversed(creators):
+            f = C(self, A)
+            if f is not None:
+                f.chain = self.sink
+                self.sink = f
 
     # Data should not be none; use b'' for EOF!
     def do_out(self, data: memoryview) -> bool:
@@ -170,10 +185,73 @@ class EndPoint(Dispatchable, Sink):
             S.connected = True
             S.buffer = None
 
+class InitialFilter(Filter):
+    initial: bytes
+    current: Optional[bytearray]
+    endpoint: EndPoint
+    def __init__(self, ep: EndPoint, b):
+        if isinstance(b, str):
+            b = bytes.fromhex(b)
+        self.initial = b
+        self.current = bytearray()
+        self.endpoint = ep
+    def out(self, b : memoryview) -> bool:
+        if self.current is None:
+            return self.chain.out(b)
+        self.current += b               # type: ignore
+        if len(self.current) >= len(self.initial):
+            if self.current.startswith(self.initial):
+                # Success...
+                mv = memoryview(self.current)
+                self.current = None
+                return self.chain.out(mv)
+        else:
+            if self.initial.startswith(self.current) and b:
+                return True
+        self.endpoint.so_linger_0()
+        self.endpoint.peer.so_linger_0()
+        self.endpoint.kill()
+        return False
+
+filter_list: List[Tuple[str,FilterCreator]]
+filter_list=[]
+filter_dict: Dict[str,Tuple[int,FilterCreator]]
+filter_dict={}
+
+def filter_socket_option(level: int, name: str) -> FilterCreator:
+    option: int = getattr(socketmodule, name)
+    return lambda ep, value: ep.setsockopt(level, option, value)
+
+for N in dir(socketmodule):
+    if N.startswith('SO_'):
+        filter_list.append((N, filter_socket_option(SOL_SOCKET, N)))
+    if N.startswith('IP_'):
+        filter_list.append((N, filter_socket_option(IPPROTO_IP, N)))
+    if N.startswith('IPV6_'):
+        filter_list.append((N, filter_socket_option(IPPROTO_IPV6, N)))
+    if N.startswith('TCP_'):
+        filter_list.append((N, filter_socket_option(IPPROTO_TCP, N)))
+
+filter_list.append(('initial', InitialFilter))
+
+for n, (N, F) in enumerate(filter_list):
+    filter_dict[N] = n, F
+
+def filter_lookup(key) -> Tuple[str, int, Optional[FilterCreator]]:
+    if not isinstance(key, str):
+        return '', 0, None
+    for prefix in '+-', '+', '-', '':
+        if key.startswith(prefix) and key[len(prefix):] in filter_dict:
+            n, F = filter_dict[key[len(prefix):]]
+            return prefix or '+', n, F
+    return '', 0, None
+
 class FlowAcceptor(SocketReader):
-    __slots__ = 'destfamily', 'destaddress', 'selector'
+    __slots__ = 'destfamily', 'destaddress', 'selector', 'forwards', 'backwards'
     family: int
     selector: BaseSelector
+    forwards: List[Tuple[int, FilterCreator, Any]]
+    backwards: List[Tuple[int, FilterCreator, Any]]
     def __init__(self, destfamily: int, destaddress, sel: BaseSelector,
                  *args, **kwargs):
         super(FlowAcceptor, self).__init__(*args, **kwargs)
@@ -187,15 +265,17 @@ class FlowAcceptor(SocketReader):
             return
         A = EndPoint(fileno=fd)
         B = EndPoint(self.destfamily, SOCK_STREAM, 0)
+        A.peer = B
+        B.peer = A
         A.settimeout(0)
         B.settimeout(0)
+        A.setfilters(self.forwards)
+        B.setfilters(self.backwards)
         try:
             B.connect(self.destaddress)
         except BlockingIOError:
             pass
         B.connected = False
-        A.peer = B
-        B.peer = A
         A.reregister(self.selector)
         B.reregister(self.selector)
 
@@ -207,7 +287,16 @@ def gai(host: Optional[str], port: Union[str,int,None],
 
 def load_config(selector: BaseSelector, y):
     for flow_name, flow_config in y.items():
+        forwards = []
+        backwards = []
         for K, V in flow_config.items():
+            sign, prio, creator = filter_lookup(K)
+            if creator is not None:
+                if '+' in sign:
+                    forwards.append((prio, creator, V))
+                if '-' in sign:
+                    backwards.append((prio, creator, V))
+                continue
             # Any key that is not known is assumed to be a source: dest pair.
             host: Optional[str]
             if isinstance(K, str) and ':' in K:
@@ -224,13 +313,17 @@ def load_config(selector: BaseSelector, y):
                 f.bind(addr)
                 f.listen()
                 f.reregister(selector)
+                f.forwards = forwards
+                f.backwards = backwards
+        forwards.sort()
+        backwards.sort()
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='TCP relay')
     parser.add_argument('config_file', type=argparse.FileType('r'))
     args = parser.parse_args()
     selector = DefaultSelector()
-    y = yaml.safe_load(args.config_file)
+    y = yaml.full_load(args.config_file) # type: ignore
     load_config(selector, y)
     while True:
         Dispatchable.dispatch(selector, 86400)
@@ -249,16 +342,19 @@ class TestBase(object):
     c: EndPoint
     d: SocketReader
 
+    @classmethod
+    def config(self, ahost: str, aport: int):
+        return {'flow': { f'{ahost}:0': f'{ahost}:{aport}' }}
+
     def setup_method(self) -> None:
         acceptor = socket(self.AF, SOCK_STREAM)
         acceptor.bind(('localhost', 0))
         acceptor.listen(1)
         ahost, aport = acceptor.getsockname()[:2]
         self.E = DefaultSelector()
-        load_config(self.E, {'flow': { f'{ahost}:0': f'{ahost}:{aport}' }})
+        load_config(self.E, self.config(ahost, aport))
         # There should be a single item in the map...
-        assert len(self.E.get_map()) == 1
-        _, _, _, listener = next(iter(self.E.get_map().values()))
+        (_, _, _, listener), = self.E.get_map().values()
         self.a = self.aa(self.AF, SOCK_STREAM)
         self.a.connect(listener.getsockname())
         Dispatchable.dispatch(self.E, 1)
@@ -284,6 +380,19 @@ class TestBase(object):
         for X in self.a, self.d, self.E:
             X.close()
 
+    def recv_wait(self, s: socket, n: int) -> bytes:
+        for _ in range(10):
+            assert Dispatchable.dispatch(self.E, 1)
+            try:
+                return s.recv(n)
+            except BlockingIOError:
+                pass
+        assert False
+
+    def raises(self, C):
+        import pytest                   # type: ignore
+        return pytest.raises(C)
+
 class TestEndPoint(TestBase):
     def test_simple(self) -> None:
         a, b, c, d = self.a, self.b, self.c, self.d
@@ -297,8 +406,7 @@ class TestEndPoint(TestBase):
         assert d.recv(10) == b'abcd'
         b.inready()
         assert b.sinkready
-        import pytest                   # type: ignore
-        with pytest.raises(BlockingIOError):
+        with self.raises(BlockingIOError):
             d.recv(10)
 
     def test_overload(self) -> None:
@@ -324,12 +432,7 @@ class TestEndPoint(TestBase):
         # Now drive the I/O and read back, checking the data.
         recv = 0
         while True:
-            assert Dispatchable.dispatch(self.E, 1)
-            try:
-                got = self.d.recv(BUFFER_SIZE)
-            except BlockingIOError:
-                continue
-
+            got = self.recv_wait(self.d, BUFFER_SIZE)
             if not got:
                 break
 
@@ -343,28 +446,15 @@ class TestEndPoint(TestBase):
         self.a.setsockopt(SOL_SOCKET, SO_LINGER, struct.pack('ii', 1, 0))
         self.a.close()
         # Now drive until d doesn't give EAGAIN.
-        import pytest
-        with pytest.raises(ConnectionError):
-            while True:
-                assert Dispatchable.dispatch(self.E, 1)
-                try:
-                    self.d.recv(10)
-                    break
-                except BlockingIOError:
-                    pass
+        with self.raises(ConnectionError):
+            self.recv_wait(self.d, 10)
         assert self.b.regevents == 0
         assert self.c.regevents == 0
 
     def test_reset_after_shutdown(self) -> None:
         # Do a shutdown on 'a' and then drive until it comes out 'd'.
         self.a.shutdown(SHUT_WR)
-        while True:
-            assert Dispatchable.dispatch(self.E, 1)
-            try:
-                got = self.d.recv(10)
-                break
-            except BlockingIOError:
-                continue
+        got = self.recv_wait(self.d, 10)
         assert not got
         assert self.c.sinkready
         self.E.unregister(self.d)
@@ -373,8 +463,7 @@ class TestEndPoint(TestBase):
         # a write should get an error.
         self.a.setsockopt(SOL_SOCKET, SO_LINGER, struct.pack('ii', 1, 0))
         self.a.close()
-        import pytest
-        with pytest.raises(ConnectionError):
+        with self.raises(ConnectionError):
             for _ in range(10):
                 self.d.send(b'1')
                 Dispatchable.dispatch(self.E, 0.1)
@@ -419,6 +508,41 @@ class TestBasicFlow(TestBase):
 
 class TestBasicFlow6(TestBasicFlow):
     AF = AF_INET6
+
+class TestInitial(TestBase):
+    @classmethod
+    def config(self, ahost: str, aport: int):
+        return { 'flow': {
+            f'{ahost}:0': f'{ahost}:{aport}',
+            'initial': b'arbitrary'.hex() }}
+
+    def test_baddata(self):
+        self.a.send(b'arb1tra')
+        with self.raises(ConnectionError):
+            self.recv_wait(self.d, 10)
+        with self.raises(ConnectionError):
+            self.recv_wait(self.a, 10)
+
+    def test_earlyclose(self):
+        self.a.send(b'arbitra')
+        self.a.shutdown(SHUT_WR)
+        with self.raises(ConnectionError):
+            self.recv_wait(self.d, 10)
+
+    def test_ok(self):
+        self.a.send(b'arb')
+        self.a.send(b'i')
+        self.a.send(b'trary123')
+        got = self.recv_wait(self.d, 15)
+        assert got == b'arbitrary123'
+        self.a.send(b'moremoremore')
+        got = self.recv_wait(self.d, 15)
+        assert got == b'moremoremore'
+
+    def test_back(self):
+        self.d.send(b'goingbackwards')
+        got = self.recv_wait(self.a, 15)
+        assert got == b'goingbackwards'
 
 if __name__ == "__main__":
     main()
