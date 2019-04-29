@@ -8,6 +8,7 @@ if typing.TYPE_CHECKING:
 else:
     import _socket as socketmodule
     from _socket import *
+import os
 from selectors import BaseSelector, DefaultSelector, EVENT_READ, EVENT_WRITE
 import struct
 from typing import \
@@ -15,6 +16,9 @@ from typing import \
 import yaml
 
 BUFFER_SIZE = 1024
+
+if not 'IPPROTO_IPV6' in globals():
+    IPPROTO_IPV6 = 41
 
 class Dispatchable(socket):
     def __init__(self, family=-1, type=-1, proto=-1, fileno=None):
@@ -443,6 +447,7 @@ class TestEndPoint(TestBase):
         assert ~self.b.regevents & EVENT_READ
 
     def test_reset_propagation(self) -> None:
+        self.E.unregister(self.a)
         self.a.setsockopt(SOL_SOCKET, SO_LINGER, struct.pack('ii', 1, 0))
         self.a.close()
         # Now drive until d doesn't give EAGAIN.
@@ -461,6 +466,7 @@ class TestEndPoint(TestBase):
         # Now reset 'a' and check that this comes out 'd'.  It won't
         # spontaneously arrive because we're no longer reading, but eventually
         # a write should get an error.
+        self.E.unregister(self.a)
         self.a.setsockopt(SOL_SOCKET, SO_LINGER, struct.pack('ii', 1, 0))
         self.a.close()
         with self.raises(ConnectionError):
