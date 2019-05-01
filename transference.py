@@ -348,7 +348,7 @@ class TestBase(object):
 
     @classmethod
     def config(self, ahost: str, aport: int):
-        return {'flow': { f'{ahost}:0': f'{ahost}:{aport}' }}
+        return {'flow': { ahost + ':0' : ahost + ':' + str(aport) }}
 
     def setup_method(self) -> None:
         acceptor = socket(self.AF, SOCK_STREAM)
@@ -519,7 +519,7 @@ class TestInitial(TestBase):
     @classmethod
     def config(self, ahost: str, aport: int):
         return { 'flow': {
-            f'{ahost}:0': f'{ahost}:{aport}',
+            ahost + ':0': ahost + ':' +str(aport),
             'initial': b'arbitrary'.hex() }}
 
     def test_baddata(self):
