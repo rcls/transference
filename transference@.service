@@ -1,0 +1,10 @@
+[Unit]
+Description=Transference TCP relay '%i'
+After=network.target.
+
+[Service]
+ExecStart=/usr/bin/transference /etc/transference/%i.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+
+[Install]
+WantedBy=multi-user.target
