@@ -55,13 +55,13 @@ class Dispatchable(socket):
             return False
         L = sel.select(timeout)
 
-        for (obj, fd, events, data), ev in L:
+        for key, ev in L:
             if ev & EVENT_READ:
-                data.inready()
+                key.data.inready()
             if ev & EVENT_WRITE:
-                data.outready()
-        for (obj, fd, events, data), ev in L:
-            data.reregister()
+                key.data.outready()
+        for key, ev in L:
+            key.data.reregister()
         return bool(L)
 
 class SocketReader(Dispatchable):
