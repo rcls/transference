@@ -21,16 +21,22 @@ if not 'IPPROTO_IPV6' in globals():
     IPPROTO_IPV6 = 41
 
 class Dispatchable(socket):
+    __slots__ = 'selector',
+    selector : BaseSelector
     def __init__(self, family=-1, type=-1, proto=-1, fileno=None):
         super(Dispatchable, self).__init__(family, type, proto, fileno)
         if fileno is None and self.family == AF_INET6:
             self.setsockopt(IPPROTO_IPV6, IPV6_V6ONLY, 1)
         self.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+        self.selector = None
     def inready(self) -> None:
         pass
     def outready(self) -> None:
         pass
-    def reregister(self, sel: BaseSelector) -> None:
+    def start(self, sel: BaseSelector) -> None:
+        self.selector = sel
+        self.reregister()
+    def reregister(self) -> None:
         raise NotImplementedError
     def so_linger_0(self) -> None:
         try:
@@ -55,7 +61,7 @@ class Dispatchable(socket):
             if ev & EVENT_WRITE:
                 data.outready()
         for (obj, fd, events, data), ev in L:
-            data.reregister(sel)
+            data.reregister()
         return bool(L)
 
 class SocketReader(Dispatchable):
@@ -66,11 +72,11 @@ class SocketReader(Dispatchable):
         super(SocketReader, self).__init__(*args, **kwargs)
         self.wanted = True
         self.isreg = False
-    def reregister(self, sel: BaseSelector) -> None:
+    def reregister(self) -> None:
         if self.wanted and not self.isreg:
-            sel.register(self, EVENT_READ, self)
+            self.selector.register(self, EVENT_READ, self)
         elif self.isreg and not self.wanted:
-            sel.unregister(self)
+            self.selector.unregister(self)
         self.isreg = self.wanted
     def kill(self) -> None:
         self.close()
@@ -164,7 +170,7 @@ class EndPoint(Dispatchable, Sink):
         if self.buffer is not None:
             self.peer.sinkready = self.do_out(self.buffer)
 
-    def reregister(self, sel) -> None:
+    def reregister(self) -> None:
         for S in self, self.peer:
             wanted = EVENT_READ if S.sinkready and S.connected else 0
             if S.buffer is not None or not S.connected:
@@ -172,21 +178,25 @@ class EndPoint(Dispatchable, Sink):
             if wanted == S.regevents:
                 continue
             elif S.regevents == 0:
-                sel.register(S, wanted, S)
+                self.selector.register(S, wanted, S)
             elif wanted == 0:
-                sel.unregister(S)
+                self.selector.unregister(S)
             else:
-                sel.modify(S, wanted, S)
+                self.selector.modify(S, wanted, S)
             S.regevents = wanted
         if self.regevents == 0 and self.peer.regevents == 0:
-            self.kill()
+            self.close()
+            self.peer.close()
 
     def kill(self) -> None:
         for S in self, self.peer:
-            S.close()
             S.sinkready = False
             S.connected = True
             S.buffer = None
+            if S.regevents != 0:
+                S.selector.unregister(S)
+                S.regevents = 0
+            S.close()
 
 class InitialFilter(Filter):
     initial: bytes
@@ -279,8 +289,8 @@ class FlowAcceptor(SocketReader):
         except BlockingIOError:
             pass
         B.connected = False
-        A.reregister(self.selector)
-        B.reregister(self.selector)
+        A.start(self.selector)
+        B.start(self.selector)
 
 def gai(host: Optional[str], port: Union[str,int,None],
         family: int = 0) -> List[Tuple[int,int,int,str,Any]]:
@@ -315,7 +325,7 @@ def load_config(selector: BaseSelector, y):
                 f = FlowAcceptor(daf, daddr, selector, af, kind, proto)
                 f.bind(addr)
                 f.listen()
-                f.reregister(selector)
+                f.start(selector)
                 f.forwards = forwards
                 f.backwards = backwards
         forwards.sort()
@@ -377,7 +387,7 @@ class TestBase(object):
         for X in self.a, self.b, self.c, self.d:
             X.settimeout(0)
             X.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
-            X.reregister(self.E)
+            X.start(self.E)
 
     def teardown_method(self) -> None:
         for _, _, _, X in self.E.get_map().values():
