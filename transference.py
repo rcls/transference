@@ -32,6 +32,11 @@ class Dispatchable(socket):
         pass
     def reregister(self, sel: BaseSelector) -> None:
         raise NotImplementedError
+    def so_linger_0(self) -> None:
+        try:
+            self.setsockopt(SOL_SOCKET, SO_LINGER, struct.pack('ii', 1, 0))
+        except OSError:
+            pass
     def kill(self) -> None:
         pass
 
@@ -175,12 +180,6 @@ class EndPoint(Dispatchable, Sink):
             S.regevents = wanted
         if self.regevents == 0 and self.peer.regevents == 0:
             self.kill()
-
-    def so_linger_0(self) -> None:
-        try:
-            self.setsockopt(SOL_SOCKET, SO_LINGER, struct.pack('ii', 1, 0))
-        except OSError:
-            pass
 
     def kill(self) -> None:
         for S in self, self.peer:
@@ -345,25 +344,27 @@ class TestBase(object):
     b: EndPoint
     c: EndPoint
     d: SocketReader
+    acceptor: socket
+    listener: FlowAcceptor
 
     @classmethod
     def config(self, ahost: str, aport: int):
         return {'flow': { ahost + ':0' : ahost + ':' + str(aport) }}
 
     def setup_method(self) -> None:
-        acceptor = socket(self.AF, SOCK_STREAM)
-        acceptor.bind(('localhost', 0))
-        acceptor.listen(1)
-        ahost, aport = acceptor.getsockname()[:2]
+        self.acceptor = socket(self.AF, SOCK_STREAM)
+        self.acceptor.bind(('localhost', 0))
+        self.acceptor.listen(1)
+        ahost, aport = self.acceptor.getsockname()[:2]
         self.E = DefaultSelector()
         load_config(self.E, self.config(ahost, aport))
         # There should be a single item in the map...
-        (_, _, _, listener), = self.E.get_map().values()
+        (_, _, _, self.listener), = self.E.get_map().values()
         self.a = self.aa(self.AF, SOCK_STREAM)
-        self.a.connect(listener.getsockname())
+        self.a.connect(self.listener.getsockname())
         Dispatchable.dispatch(self.E, 1)
         for _, _, _, s in self.E.get_map().values():
-            if s == listener:
+            if s == self.listener:
                 pass
             elif s.connected:
                 self.b = s
@@ -371,7 +372,7 @@ class TestBase(object):
                 self.c = s
         assert hasattr(self, 'b')
         assert hasattr(self, 'c')
-        serverfd, _ = acceptor._accept() # type: ignore
+        serverfd, _ = self.acceptor._accept() # type: ignore
         self.d = self.dd(fileno=serverfd)
         for X in self.a, self.b, self.c, self.d:
             X.settimeout(0)
@@ -381,7 +382,7 @@ class TestBase(object):
     def teardown_method(self) -> None:
         for _, _, _, X in self.E.get_map().values():
             X.close()
-        for X in self.a, self.d, self.E:
+        for X in self.a, self.d, self.E, self.acceptor, self.listener:
             X.close()
 
     def recv_wait(self, s: socket, n: int) -> bytes:
@@ -448,7 +449,7 @@ class TestEndPoint(TestBase):
 
     def test_reset_propagation(self) -> None:
         self.E.unregister(self.a)
-        self.a.setsockopt(SOL_SOCKET, SO_LINGER, struct.pack('ii', 1, 0))
+        self.a.so_linger_0()
         self.a.close()
         # Now drive until d doesn't give EAGAIN.
         with self.raises(ConnectionError):
@@ -467,7 +468,7 @@ class TestEndPoint(TestBase):
         # spontaneously arrive because we're no longer reading, but eventually
         # a write should get an error.
         self.E.unregister(self.a)
-        self.a.setsockopt(SOL_SOCKET, SO_LINGER, struct.pack('ii', 1, 0))
+        self.a.so_linger_0()
         self.a.close()
         with self.raises(ConnectionError):
             for _ in range(10):
@@ -549,6 +550,47 @@ class TestInitial(TestBase):
         self.d.send(b'goingbackwards')
         got = self.recv_wait(self.a, 15)
         assert got == b'goingbackwards'
+
+class TestReaccept(TestBase):
+    def fin_shutter(self):
+        self.a.shutdown(SHUT_WR)
+        self.d.shutdown(SHUT_WR)
+    def rst_shutter(self):
+        self.a.so_linger_0()
+        self.a.close()
+
+    def run_reaccept(self, shutter):
+        filenos = set((self.b.fileno(), self.c.fileno()))
+        objects = set(X.data for X in self.E.get_map().values())
+        shutter()
+        a2 = socket(self.AF, SOCK_STREAM)
+        a2.connect(self.listener.getsockname())
+        # Now drive everything manually....
+        import time
+        time.sleep(0.1)                 # I have no pride.
+        self.c.outready()
+        self.b.inready()
+        self.c.inready()
+        # This should get b, c idle...
+        self.b.reregister()
+        self.c.reregister()
+        assert self.b.regevents == 0
+        assert self.c.regevents == 0
+
+        # Now drive the accept...
+        self.listener.inready()
+        # Check that we've tested what we wanted to: this should get a fileno we
+        # just closed.
+        new_objs = set(X.data for X in self.E.get_map().values()) - objects
+        assert len(new_objs) == 2
+        new_filenos = set(X.fileno() for X in new_objs)
+        assert new_filenos == filenos
+
+    def test_fin_reaccept(self):
+        self.run_reaccept(self.fin_shutter)
+
+    def test_rst_reaccept(self):
+        self.run_reaccept(self.rst_shutter)
 
 if __name__ == "__main__":
     main()
