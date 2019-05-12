@@ -51,8 +51,6 @@ class Dispatchable(socket):
             self.setsockopt(SOL_SOCKET, SO_LINGER, struct.pack('ii', 1, 0))
         except OSError:
             pass
-    def kill(self) -> None:
-        pass
 
     @classmethod
     def dispatch(self, sel: BaseSelector, timeout: float) -> bool:
@@ -328,7 +326,7 @@ def main() -> None:
     parser.add_argument('config_file', type=argparse.FileType('r'))
     args = parser.parse_args()
     selector = DefaultSelector()
-    y = yaml.full_load(args.config_file) # type: ignore
+    y = yaml.load(args.config_file) # type: ignore
     load_config(selector, y)
     while True:
         Dispatchable.dispatch(selector, 86400)
