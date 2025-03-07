@@ -1,15 +1,14 @@
 #!/usr/bin/python3
 
+import abc
 import argparse
 import typing
-if typing.TYPE_CHECKING:
-    import socket as socketmodule
-    from socket import *
-else:
-    import _socket as socketmodule
-    from _socket import *
+import _socket as socketmodule
+from _socket import *
+
 import os
 from selectors import BaseSelector, DefaultSelector, EVENT_READ, EVENT_WRITE
+import secrets
 import struct
 from typing import \
     Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union
@@ -83,6 +82,7 @@ class SocketReader(Dispatchable):
         self.wanted = False
 
 class Sink(object):
+    @abc.abstractmethod
     def out(self, data: memoryview) -> bool:
         pass
 
@@ -241,6 +241,7 @@ for n, (N, F) in enumerate(filter_list):
     filter_dict[N] = n, F
 
 def filter_lookup(key) -> Tuple[str, int, Optional[FilterCreator]]:
+    # Returns (direction, priority, creator)
     if not isinstance(key, str):
         return '', 0, None
     for prefix in '+-', '+', '-', '':
@@ -250,21 +251,31 @@ def filter_lookup(key) -> Tuple[str, int, Optional[FilterCreator]]:
     return '', 0, None
 
 class FlowAcceptor(SocketReader):
-    __slots__ = 'destfamily', 'destaddress', 'forwards', 'backwards'
+    __slots__ = 'name', 'destfamily', 'destaddress', 'forwards', 'backwards'
+    name: str
     family: int
     forwards: List[Tuple[int, FilterCreator, Any]]
     backwards: List[Tuple[int, FilterCreator, Any]]
-    def __init__(self, destfamily: int, destaddress, sel: BaseSelector,
-                 *args, **kwargs):
+    def __init__(self, name: str, destfamily: int, destaddress,
+                 sel: BaseSelector, *args, **kwargs):
         super(FlowAcceptor, self).__init__(*args, **kwargs)
+        self.name        = name
         self.destfamily  = destfamily
         self.destaddress = destaddress
         self.selector    = sel
     def inready(self) -> None:
         try:
-            fd, _ = self._accept()      # type: ignore
+            if not typing.TYPE_CHECKING:
+                fd, address = self._accept()
+            else:
+                fd, address = 0, ''
         except OSError:
             return
+        if type(address) in (list, tuple):
+            aname = ' '.join(str(x) for x in address)
+        else:
+            aname = str(address)
+        print(f'{self.name}: Connect from {aname}')
         A = EndPoint(fileno=fd)
         B = EndPoint(self.destfamily, SOCK_STREAM, 0)
         A.peer = B
@@ -284,13 +295,22 @@ class FlowAcceptor(SocketReader):
 def gai(host: Optional[str], port: Union[str,int,None],
         family: int = 0) -> List[Tuple[int,int,int,str,Any]]:
     # We always use AI_PASSIVE, people who want localhost can say so.
-    return getaddrinfo(host, port, family, SOCK_STREAM, IPPROTO_TCP,
-                       AI_PASSIVE | AI_ADDRCONFIG)
+    # Returns (af, kind, proto, canonname, addr).
+    if host is None or not host.startswith('$'):
+        return getaddrinfo(host, port, family, SOCK_STREAM, IPPROTO_TCP,
+                           AI_PASSIVE | AI_ADDRCONFIG)
+    # Do a lookup for the family, but use the original string as the host.
+    host = host[1:]
+    r = getaddrinfo(host, port, family, SOCK_STREAM, IPPROTO_TCP,
+                    AI_PASSIVE | AI_ADDRCONFIG)
+    af, kind, proto, canon, addr = r[0]
+    return [(af, kind, proto, canon, (host, addr[1]))]
 
 def load_config(selector: BaseSelector, y):
     for flow_name, flow_config in y.items():
         forwards = []
         backwards = []
+        name = str(flow_name)
         for K, V in flow_config.items():
             sign, prio, creator = filter_lookup(K)
             if creator is not None:
@@ -311,7 +331,7 @@ def load_config(selector: BaseSelector, y):
                 dhost, dport = V, port
             daf, _, _, _, daddr = gai(dhost, dport)[0]
             for af, kind, proto, _, addr in gai(host, port):
-                f = FlowAcceptor(daf, daddr, selector, af, kind, proto)
+                f = FlowAcceptor(name, daf, daddr, selector, af, kind, proto)
                 f.bind(addr)
                 f.listen()
                 f.selector = selector
@@ -326,7 +346,7 @@ def main() -> None:
     parser.add_argument('config_file', type=argparse.FileType('r'))
     args = parser.parse_args()
     selector = DefaultSelector()
-    y = yaml.load(args.config_file) # type: ignore
+    y = yaml.safe_load(args.config_file) # type: ignore
     load_config(selector, y)
     while True:
         Dispatchable.dispatch(selector, 86400)
